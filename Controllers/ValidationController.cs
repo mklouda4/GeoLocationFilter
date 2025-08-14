@@ -92,6 +92,21 @@ namespace GeoLocationFilter.Controllers
             return Ok(new { ipAddress = clientIp });
         }
 
+
+        [HttpGet("/checkip")]
+        public async Task<IActionResult> CheckIp([FromQuery] string ipAddress)
+        {
+            try
+            {
+                var countryCode = await GetCountryCodeForIp(ipAddress);
+                return Ok(new { ipAddress = ipAddress, countryCode = countryCode });
+            }
+            catch 
+            {
+                return Ok(new { ipAddress = ipAddress, countryCode = "NA", status = "Error" });
+            }
+        }
+
         private string? GetClientIpAddress()
         {
             var ipSources = new[]
