@@ -34,9 +34,7 @@ namespace GeoLocationFilter.Controllers
         private static readonly Counter GeoApiCalls = Metrics
             .CreateCounter("geoguard_geo_api_calls_total", "External geo API calls", "result");
 
-        private static readonly Counter RateLimitHits = Metrics
-            .CreateCounter("geoguard_rate_limit_hits_total", "Rate limit hits by policy", "policy");
-
+        [HttpGet("/")]
         [HttpGet("/validate")]
         public async Task<IActionResult> ValidateRequest()
         {
@@ -57,7 +55,6 @@ namespace GeoLocationFilter.Controllers
                 Response.Headers.AddOrReplace("X-GeoFilter-Country", blockResult.CountryCode ?? "unknown");
                 Response.Headers.AddOrReplace("X-GeoFilter-Reason", blockResult.Reason ?? "geo-check");
 
-                // Zaznamenat metriku
                 RequestsTotal.WithLabels(
                     blockResult.IsBlocked ? "blocked" : "allowed",
                     blockResult.CountryCode ?? "unknown",
@@ -67,17 +64,16 @@ namespace GeoLocationFilter.Controllers
                 if (blockResult.IsBlocked)
                 {
                     logger.LogWarning($"Request blocked: IP={clientIp}, Country={blockResult.CountryCode}, Reason={blockResult.Reason}");
-                    return StatusCode(403, new { message = "Access denied", reason = blockResult.Reason });
+                    return StatusCode(403, new { message = "Access denied", country = blockResult.CountryCode, reason = blockResult.Reason, ipAddress = clientIp });
                 }
 
                 logger.LogDebug($"Request allowed: IP={clientIp}, Country={blockResult.CountryCode}");
-                return Ok(new { message = "Access granted", country = blockResult.CountryCode });
+                return Ok(new { message = "Access granted", country = blockResult.CountryCode, ipAddress = clientIp });
             }
             catch (Exception ex)
             {
                 logger.LogError(ex, $"Error during request validation for IP={clientIp}");
 
-                // Zaznamenat error metriku
                 RequestsTotal.WithLabels("error", "unknown", "exception").Inc();
 
                 var allowOnError = !_options.BlockUnknown;
@@ -87,6 +83,13 @@ namespace GeoLocationFilter.Controllers
 
                 return allowOnError ? Ok() : StatusCode(403);
             }
+        }
+
+        [HttpGet("/ip")]
+        public IActionResult IpRequest()
+        {
+            var clientIp = GetClientIpAddress();
+            return Ok(new { ipAddress = clientIp });
         }
 
         private string? GetClientIpAddress()
