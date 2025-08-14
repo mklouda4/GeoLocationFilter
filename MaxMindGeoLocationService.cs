@@ -33,7 +33,7 @@ namespace GeoLocationFilter.Services
         {
             _logger = logger;
             _configuration = configuration;
-            _databasePath = _configuration["DbPath"];
+            _databasePath = _configuration["DbPath"] ?? $"/data/GeoLite2-Country.mmdb";
 
             _ = InitializeAsync();
         }
@@ -66,6 +66,8 @@ namespace GeoLocationFilter.Services
                 _logger.LogInformation("MaxMind database loaded successfully from {DatabasePath}", _databasePath);
                 _logger.LogInformation("Database metadata: {Metadata}",
                     $"Type: {_reader.Metadata.DatabaseType}, Build: {_reader.Metadata.BuildDate}");
+
+                await Task.CompletedTask;
             }
             catch (Exception ex)
             {
