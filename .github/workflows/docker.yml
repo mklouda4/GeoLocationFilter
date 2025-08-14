@@ -87,7 +87,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "GeoGuard API ${{ github.ref_name }}"
+          name: "GeoLocationFilter API ${{ github.ref_name }}"
           generate_release_notes: true
           files: |
             sbom.spdx.json
@@ -109,7 +109,7 @@ jobs:
             
             # Using docker run
             docker run -d \
-              --name geoguard \
+              --name geolocationfilter \
               -p 127.0.0.1:8080:8080 \
               -e ALLOWED_COUNTRIES=CZ,SK,DE \
               -e BLOCKED_COUNTRIES=CN,RU \
