@@ -174,7 +174,8 @@ namespace GeoLocationFilter
                 ["RATELIMIT_HEALTH_PERMIT_LIMIT"] = "RateLimit:Health:PermitLimit",
                 ["RATELIMIT_HEALTH_WINDOW_MINUTES"] = "RateLimit:Health:WindowMinutes",
                 ["RATELIMIT_BURST_PERMIT_LIMIT"] = "RateLimit:Burst:PermitLimit",
-                ["RATELIMIT_BURST_WINDOW_MINUTES"] = "RateLimit:Burst:WindowMinutes"
+                ["RATELIMIT_BURST_WINDOW_MINUTES"] = "RateLimit:Burst:WindowMinutes",
+                ["FALLBACK_API"] = "FallbackApi"
             };
 
             // Apply simple mappings

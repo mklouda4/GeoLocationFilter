@@ -10,12 +10,15 @@ namespace GeoLocationFilter.Controllers
     [ApiController]
     [Route("[controller]")]
     public class ValidationController(
+        IConfiguration configuration,
         IOptions<SecurityOptions> options,
         ILogger<ValidationController> logger,
         IGeoLocationService locationService,
         IHttpClientFactory httpClientFactory,
         IMemoryCache cache) : ControllerBase
     {
+        private readonly string fallbackApiUri = configuration["FallbackApi"] ?? "https://get.geojs.io/v1/ip/country/{0}";
+
         private readonly SecurityOptions _options = options.Value;
         private static readonly TimeSpan CacheTimeout = TimeSpan.FromHours(24);
 
@@ -93,7 +96,7 @@ namespace GeoLocationFilter.Controllers
         }
 
 
-        [HttpGet("/checkip")]
+        [HttpGet("/check")]
         public async Task<IActionResult> CheckIp([FromQuery] string ipAddress)
         {
             try
@@ -227,17 +230,23 @@ namespace GeoLocationFilter.Controllers
         }
 
         private Task<string?> MaxMind(string ipAddress)
-        {
-            return locationService.GetCountryCodeAsync(ipAddress);
-        }
+            => locationService.GetCountryCodeAsync(ipAddress);
 
         private async Task<string?> Fallback(string ipAddress)
         {
             try
             {
+                if (!fallbackApiUri.Contains("{0}"))
+                {
+                    logger.LogError("FallbackApi URL must contain {{0}} placeholder for IP address");
+                    return null;
+                }
+
                 using var httpClient = httpClientFactory.CreateClient("GeoApi");
 
-                var response = await httpClient.GetAsync($"https://get.geojs.io/v1/ip/country/{ipAddress}");
+                var uri = string.Format(fallbackApiUri, ipAddress);
+
+                var response = await httpClient.GetAsync(uri);
                 if (response.IsSuccessStatusCode)
                 {
                     var countryCode = (await response.Content.ReadAsStringAsync())?.Trim();

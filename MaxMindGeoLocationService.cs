@@ -16,9 +16,8 @@ namespace GeoLocationFilter.Services
         private readonly IConfiguration _configuration;
         private DatabaseReader? _reader;
         private FileSystemWatcher? _fileWatcher;
-        private readonly object _lock = new();
         private string? _databasePath;
-        private DateTime _lastLoadTime;
+        private SemaphoreLock _lock = new();
 
         // Metrics
         private static readonly Counter MaxMindLookups = Metrics
@@ -54,12 +53,12 @@ namespace GeoLocationFilter.Services
                     return;
                 }
 
-                lock (_lock)
+                await _lock.WaitAsync();
                 {
                     _reader?.Dispose();
                     _reader = new DatabaseReader(_databasePath);
-                    _lastLoadTime = DateTime.UtcNow;
                 }
+                _lock.Release();
 
                 DatabaseLoadTime.SetToCurrentTimeUtc();
 
@@ -72,11 +71,12 @@ namespace GeoLocationFilter.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to load MaxMind database from {DatabasePath}", _databasePath);
-                lock (_lock)
+                await _lock.WaitAsync();
                 {
                     _reader?.Dispose();
                     _reader = null;
                 }
+                _lock.Release();
             }
         }
 
@@ -136,12 +136,11 @@ namespace GeoLocationFilter.Services
             }
 
             DatabaseReader? reader;
-            lock (_lock)
+            await _lock.WaitAsync();
             {
                 reader = _reader;
             }
-
-            await Task.CompletedTask;
+            _lock.Release();
 
             if (reader == null)
             {
@@ -178,6 +177,34 @@ namespace GeoLocationFilter.Services
             {
                 _reader?.Dispose();
             }
+        }
+    }
+
+    public class SemaphoreLock : IDisposable
+    {
+        private readonly SemaphoreSlim semaphoreSlim = new(1, 1);
+        private readonly TimeSpan defaultTimeOut = TimeSpan.FromSeconds(30);
+
+        public Task WaitAsync(TimeSpan? timeOut = null)
+            => semaphoreSlim.WaitAsync(timeOut ?? defaultTimeOut);
+        public void Wait(TimeSpan? timeOut = null)
+            => semaphoreSlim.WaitAsync(timeOut ?? defaultTimeOut);
+
+        public void Release()
+            => semaphoreSlim.Release();
+
+        protected virtual void Dispose(bool disposing)
+        {
+            semaphoreSlim?.Dispose();
+        }
+
+        ~SemaphoreLock()
+            => Dispose(disposing: false);
+        
+        public void Dispose()
+        {
+            Dispose(disposing: true);
+            GC.SuppressFinalize(this);
         }
     }
 }
