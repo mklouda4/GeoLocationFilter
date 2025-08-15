@@ -39,20 +39,28 @@ namespace GeoLocationFilter.Controllers
 
         [HttpGet("/")]
         [HttpGet("/validate")]
-        public async Task<IActionResult> ValidateRequest()
+        public async Task<IActionResult> ValidateRequest(
+            [FromQuery] string? blockedCountries = null,
+            [FromQuery] string? allowedCountries = null,
+            [FromQuery] bool? blockUnknown = null,
+            [FromQuery] bool? ignoreLocalIps = null,
+            [FromQuery] string? localIps = null)
         {
             using var timer = RequestDuration.NewTimer();
 
             var clientIp = GetClientIpAddress();
             var forwardedHost = Request.Headers["X-Forwarded-Host"].FirstOrDefault();
             var forwardedUri = Request.Headers["X-Forwarded-Uri"].FirstOrDefault();
-            var userAgent = Request.Headers["User-Agent"].FirstOrDefault();
+            var userAgent = Request.Headers.UserAgent.FirstOrDefault();
 
             logger.LogInformation($"Validating request: IP={clientIp}, Host={forwardedHost}, URI={forwardedUri}");
 
+            var securityOptions = CreateSecurityOptionsFromQuery(
+                blockedCountries, allowedCountries, blockUnknown, ignoreLocalIps, localIps);
+
             try
             {
-                var blockResult = await ShouldBlockRequest(clientIp, forwardedHost, forwardedUri, userAgent);
+                var blockResult = await ShouldBlockRequest(clientIp, forwardedHost, forwardedUri, userAgent, securityOptions);
 
                 Response.Headers.AddOrReplace("X-GeoFilter-Access", blockResult.IsBlocked ? "blocked" : "allowed");
                 Response.Headers.AddOrReplace("X-GeoFilter-Country", blockResult.CountryCode ?? "unknown");
@@ -79,7 +87,7 @@ namespace GeoLocationFilter.Controllers
 
                 RequestsTotal.WithLabels("error", "unknown", "exception").Inc();
 
-                var allowOnError = !_options.BlockUnknown;
+                var allowOnError = !securityOptions.BlockUnknown;
                 Response.Headers.AddOrReplace("X-GeoFilter-Access", allowOnError ? "allowed" : "blocked");
                 Response.Headers.AddOrReplace("X-GeoFilter-Country", "error");
                 Response.Headers.AddOrReplace("X-GeoFilter-Reason", "system-error");
@@ -91,8 +99,8 @@ namespace GeoLocationFilter.Controllers
         [HttpGet("/ip")]
         public IActionResult IpRequest()
         {
-            var clientIp = GetClientIpAddress();
-            return Ok(new { ipAddress = clientIp });
+            var ipAddress = GetClientIpAddress();
+            return Ok(new { ipAddress });
         }
 
 
@@ -102,14 +110,70 @@ namespace GeoLocationFilter.Controllers
             try
             {
                 var countryCode = await GetCountryCodeForIp(ipAddress);
-                return Ok(new { ipAddress = ipAddress, countryCode = countryCode });
+                return Ok(new { ipAddress, countryCode });
             }
             catch 
             {
-                return Ok(new { ipAddress = ipAddress, countryCode = "NA", status = "Error" });
+                return Ok(new { ipAddress, countryCode = "NA", status = "Error" });
             }
         }
 
+        private SecurityOptions CreateSecurityOptionsFromQuery(
+            string? blockedCountries,
+            string? allowedCountries,
+            bool? blockUnknown,
+            bool? ignoreLocalIps,
+            string? localIps)
+        {
+            if (string.IsNullOrEmpty(blockedCountries?.Trim()) && 
+                string.IsNullOrEmpty(allowedCountries?.Trim()) &&
+                string.IsNullOrEmpty(localIps?.Trim()) &&
+                blockUnknown == null && 
+                ignoreLocalIps == null
+            )
+            {
+                return _options;
+            }
+
+            var options = new SecurityOptions
+            {
+                BlockUnknown = blockUnknown ?? _options.BlockUnknown,
+                IgnoreLocalIps = ignoreLocalIps ?? _options.IgnoreLocalIps,
+
+                BlockedCountries = blockedCountries != null ? (ParseCountryList(blockedCountries) ?? []) : _options.BlockedCountries,
+                AllowedCountries = allowedCountries != null ? (ParseCountryList(allowedCountries) ?? []) : _options.AllowedCountries,
+                LocalIps = localIps != null ? (ParseIpList(localIps) ?? []) : _options.LocalIps
+            };
+
+            logger.LogDebug($"Using query-based security options: BlockUnknown={options.BlockUnknown}, " +
+                           $"IgnoreLocalIps={options.IgnoreLocalIps}, " +
+                           $"BlockedCountries=[{string.Join(",", options.BlockedCountries)}], " +
+                           $"AllowedCountries=[{string.Join(",", options.AllowedCountries)}], " +
+                           $"LocalIps=[{string.Join(",", options.LocalIps)}]");
+
+            return options;
+        }
+        private static List<string>? ParseCountryList(string? countries)
+        {
+            if (string.IsNullOrWhiteSpace(countries))
+                return null;
+
+            return [.. countries
+                .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(c => c.Trim().ToUpperInvariant())
+                .Where(c => !string.IsNullOrEmpty(c))];
+        }
+
+        private static List<string>? ParseIpList(string? ips)
+        {
+            if (string.IsNullOrWhiteSpace(ips))
+                return null;
+
+            return [.. ips
+                .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(ip => ip.Trim())
+                .Where(ip => !string.IsNullOrEmpty(ip))];
+        }
         private string? GetClientIpAddress()
         {
             var ipSources = new[]
@@ -123,43 +187,43 @@ namespace GeoLocationFilter.Controllers
             return ipSources.FirstOrDefault(ip => !string.IsNullOrWhiteSpace(ip));
         }
 
-        private async Task<BlockResult> ShouldBlockRequest(string? clientIp, string? host, string? uri, string? userAgent)
+        private async Task<BlockResult> ShouldBlockRequest(string? clientIp, string? host, string? uri, string? userAgent, SecurityOptions securityOptions)
         {
             if (string.IsNullOrWhiteSpace(clientIp))
             {
-                return new BlockResult(_options.BlockUnknown, null, "no-ip");
+                return new BlockResult(securityOptions.BlockUnknown, null, "no-ip", host, uri, userAgent);
             }
 
-            if (_options.IgnoreLocalIps && IsLocalIpAddress(clientIp))
+            if (securityOptions.IgnoreLocalIps && IsLocalIpAddress(clientIp, securityOptions))
             {
-                return new BlockResult(false, "LOCAL", "local-ip");
+                return new BlockResult(false, "LOCAL", "local-ip", host, uri, userAgent);
             }
 
             var countryCode = await GetCountryCodeForIp(clientIp);
             if (string.IsNullOrEmpty(countryCode))
             {
-                return new BlockResult(_options.BlockUnknown, "UNKNOWN", "unknown-country");
+                return new BlockResult(securityOptions.BlockUnknown, "UNKNOWN", "unknown-country", host, uri, userAgent);
             }
 
-            if (_options.BlockedCountries.Count > 0 && _options.BlockedCountries.Contains(countryCode))
+            if (securityOptions.BlockedCountries.Count > 0 && securityOptions.BlockedCountries.Contains(countryCode))
             {
-                return new BlockResult(true, countryCode, "in-blocklist");
+                return new BlockResult(true, countryCode, "in-blocklist", host, uri, userAgent);
             }
 
-            if (_options.AllowedCountries.Count > 0 && !_options.AllowedCountries.Contains(countryCode))
+            if (securityOptions.AllowedCountries.Count > 0 && !securityOptions.AllowedCountries.Contains(countryCode))
             {
-                return new BlockResult(true, countryCode, "not-in-allowlist");
+                return new BlockResult(true, countryCode, "not-in-allowlist", host, uri, userAgent);
             }
 
-            return new BlockResult(false, countryCode, "geo-allowed");
+            return new BlockResult(false, countryCode, "geo-allowed", host, uri, userAgent);
         }
 
-        private bool IsLocalIpAddress(string ipAddress)
+        private static bool IsLocalIpAddress(string ipAddress, SecurityOptions securityOptions)
         {
             if (!IPAddress.TryParse(ipAddress, out var ip))
                 return false;
 
-            foreach (var localRange in _options.LocalIps)
+            foreach (var localRange in securityOptions.LocalIps)
             {
                 if (IsIpInRange(ip, localRange))
                     return true;
@@ -168,7 +232,7 @@ namespace GeoLocationFilter.Controllers
             return false;
         }
 
-        private bool IsIpInRange(IPAddress ip, string cidrRange)
+        private static bool IsIpInRange(IPAddress ip, string cidrRange)
         {
             try
             {

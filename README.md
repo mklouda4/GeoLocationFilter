@@ -11,6 +11,7 @@ A high-performance REST API service for intelligent geolocation-based request fi
 
 ### **Security & Access Control**
 - **Country-based filtering** with allowlist/blocklist support
+- **Dynamic configuration** via query parameters for real-time policy changes
 - **MaxMind GeoLite2** integration for accurate geolocation
 - **Fallback API support** for enhanced reliability
 - **Local IP detection** with configurable CIDR ranges
@@ -25,6 +26,7 @@ A high-performance REST API service for intelligent geolocation-based request fi
 
 ### **Developer Experience**
 - Environment variable configuration
+- Real-time configuration override via query parameters
 - Structured logging
 - RESTful API design
 - Production and development profiles
@@ -159,8 +161,43 @@ services:
 #### **Validate Request**
 ```http
 GET /validate
+GET /validate?blockedCountries=CN,RU&blockUnknown=true
 ```
-Validates the current request and returns access status.
+Validates the current request and returns access status. Supports dynamic configuration via query parameters.
+
+**Query Parameters (Optional):**
+
+| Parameter | Type | Description | Example |
+|-----------|------|-------------|---------|
+| `blockedCountries` | string | Comma-separated list of country codes to block | `CN,RU,KP` |
+| `allowedCountries` | string | Comma-separated list of allowed country codes | `CZ,SK,US` |
+| `blockUnknown` | boolean | Block requests from unknown countries | `true` |
+| `ignoreLocalIps` | boolean | Ignore local/private IP addresses | `false` |
+| `localIps` | string | Comma-separated CIDR ranges for local IPs | `192.168.1.0/24,10.0.0.0/8` |
+
+**Query Parameter Behavior:**
+- **Configuration Override**: Query parameters completely replace corresponding configuration values
+- **Empty Values**: Empty parameter (`?blockedCountries=`) clears the list 
+- **Missing Parameters**: Use values from application configuration
+- **Priority**: Query parameters > Environment variables > appsettings.json
+
+**Examples:**
+```bash
+# Block only China and Russia, override config
+GET /validate?blockedCountries=CN,RU
+
+# Clear all blocked countries (allow all)
+GET /validate?blockedCountries=
+
+# Allow only Czech Republic and Slovakia
+GET /validate?allowedCountries=CZ,SK&blockUnknown=true
+
+# Dynamic local IP configuration
+GET /validate?localIps=192.168.1.0/24,10.0.0.0/8&ignoreLocalIps=true
+
+# Use configuration values (no query parameters)
+GET /validate
+```
 
 **Response:**
 ```json
@@ -169,6 +206,16 @@ Validates the current request and returns access status.
   "country": "CZ",
   "ipAddress": "192.168.1.100",
   "timestamp": "2025-08-15T10:30:00Z"
+}
+```
+
+**Blocked Response:**
+```json
+{
+  "message": "Access denied",
+  "country": "CN",
+  "reason": "in-blocklist",
+  "ipAddress": "1.2.3.4"
 }
 ```
 
@@ -198,9 +245,19 @@ Returns the country code for a specific IP address.
 ```json
 {
   "ipAddress": "1.2.3.4",
-  "country": "US"
+  "countryCode": "US"
 }
 ```
+
+### Response Headers
+
+All validation responses include custom headers:
+
+| Header | Description | Example |
+|--------|-------------|---------|
+| `X-GeoFilter-Access` | Access result | `allowed` / `blocked` |
+| `X-GeoFilter-Country` | Detected country code | `CZ` |
+| `X-GeoFilter-Reason` | Block/allow reason | `geo-allowed`, `in-blocklist`, `local-ip` |
 
 ### System Endpoints
 
@@ -220,6 +277,37 @@ Prometheus-compatible metrics endpoint.
 - `geoguard_requests_total` - Total HTTP requests by country and result
 - `geoguard_cache_hits_total` - Cache hit/miss statistics
 - `geoguard_geo_api_calls_total` - External API call statistics
+- `geoguard_request_duration_seconds` - Request processing time
+
+---
+
+## 🎯 Use Cases
+
+### **API Gateway Integration**
+```bash
+# Check if request should be allowed before forwarding
+curl "https://geofilter.example.com/validate" \
+  -H "X-Forwarded-For: $CLIENT_IP" \
+  -H "X-Forwarded-Host: api.example.com"
+```
+
+### **Dynamic Security Policies**
+```bash
+# Emergency blocking of specific countries
+GET /validate?blockedCountries=CN,RU,KP&blockUnknown=true
+
+# Maintenance mode - allow only local networks
+GET /validate?allowedCountries=&localIps=192.168.0.0/16&ignoreLocalIps=true
+
+# Testing with specific configuration
+GET /validate?blockedCountries=&allowedCountries=CZ&blockUnknown=false
+```
+
+### **Load Balancer Health Checks**
+```bash
+# Configure your load balancer to use:
+GET /health
+```
 
 ---
 
@@ -237,6 +325,7 @@ geoguard_requests_total{country="RU",result="blocked"}
 # Performance metrics
 geoguard_cache_hits_total{type="hit"}
 geoguard_geo_api_calls_total
+```
 
 ### Sample Grafana Dashboard Queries
 
@@ -259,7 +348,8 @@ histogram_quantile(0.95, rate(geoguard_request_duration_seconds_bucket[$__rate_i
 - **Rate Limiting**: Configurable per-endpoint protection
 - **Private IP Handling**: Automatic detection of local/private networks
 - **Fallback Security**: Graceful handling of database unavailability
-- **Logging**: Comprehensive security event logging
+- **Dynamic Configuration**: Query parameters allow real-time policy adjustments
+- **Logging**: Comprehensive security event logging with configuration tracking
 
 ---
 
@@ -272,6 +362,7 @@ histogram_quantile(0.95, rate(geoguard_request_duration_seconds_bucket[$__rate_i
 3. **Rate Limiting**: Configure appropriate limits based on expected traffic
 4. **Health Checks**: Use the `/health` endpoint for load balancer probes
 5. **Logging**: Configure structured logging for production environments
+6. **Query Parameter Security**: Consider implementing authentication for dynamic configuration endpoints in production
 
 ### Performance Tuning
 
