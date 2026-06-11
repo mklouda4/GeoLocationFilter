@@ -1,0 +1,146 @@
+name: Build and Push Docker image and create Release
+on:
+  push:
+    tags: 
+      - 'v*'
+  workflow_dispatch:
+env:
+  URL: https://git.mjhome.cz
+  REGISTRY: git.mjhome.cz
+  IMAGE_NAME: ${{ gitea.repository }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+        
+      - name: List files (debug)
+        run: |
+          echo "Current directory:"; pwd
+          echo "Files in root:"; ls -la
+          echo "Checking for Dockerfile:"; ls -la Dockerfile || echo "Dockerfile not found"
+                                        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Build and push Docker image
+        run: |
+          echo "${{ vars.GITEATOKEN }}" \
+            | docker login ${{ env.REGISTRY }} -u ${{ gitea.actor }} --password-stdin
+          TAG="${{ gitea.ref_name }}"
+          REPO_LOWER=$(echo "${{ gitea.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_VERSION="${{ env.REGISTRY }}/${REPO_LOWER}:${TAG}"
+          IMAGE_LATEST="${{ env.REGISTRY }}/${REPO_LOWER}:latest"
+          echo "Building image: ${IMAGE_VERSION}"
+          docker build --file ./Dockerfile --tag "${IMAGE_VERSION}" .
+          docker push "${IMAGE_VERSION}"
+          echo "Tagging image as latest: ${IMAGE_LATEST}"
+          docker tag "${IMAGE_VERSION}" "${IMAGE_LATEST}"
+          docker push "${IMAGE_LATEST}"
+          echo "✅ Images pushed: ${IMAGE_VERSION} and ${IMAGE_LATEST}"
+                                                         
+      - name: Cleanup Docker images
+        if: always()
+        run: |
+          TAG="${{ gitea.ref_name }}"
+          REPO_LOWER=$(echo "${{ gitea.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_VERSION="${{ env.REGISTRY }}/${REPO_LOWER}:${TAG}"
+          IMAGE_LATEST="${{ env.REGISTRY }}/${REPO_LOWER}:latest"
+          
+          echo "🧹 Cleaning up local Docker images..."
+          
+          # Smaž konkrétní images
+          docker rmi "${IMAGE_VERSION}" || true
+          docker rmi "${IMAGE_LATEST}" || true
+          
+          # Smaž dangling images (intermediate layers bez tagu)
+          docker image prune -f
+          
+          # Smaž build cache starší než 1h
+          docker builder prune -f --filter "until=1h"
+          
+          echo "✅ Cleanup completed"
+          docker system df
+                                        
+      - name: Create Gitea Release with Notes
+        run: |
+          git fetch --tags          
+          
+          GITEA_REF_NAME="${{ gitea.ref_name }}"
+          GITEA_REPO="${{ gitea.repository }}"
+          REGISTRY="${{ env.REGISTRY }}"
+          URL="${{ env.URL }}"
+          
+          REPO_LOWER=$(echo "${GITEA_REPO}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME=$(echo "${GITEA_REPO##*/}")
+          TAG="${GITEA_REF_NAME#refs/tags/}"
+          
+          # Získej předchozí tag pro diff
+          PREVIOUS_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n 1)
+          
+          # Získej commit messages od předchozího tagu
+          if [ -n "$PREVIOUS_TAG" ]; then
+            COMMIT_MESSAGES=$(git log --pretty=format:"- %s (%h)" ${PREVIOUS_TAG}..${TAG})
+          else
+            COMMIT_MESSAGES=$(git log --pretty=format:"- %s (%h)" ${TAG})
+          fi
+          
+          # Vytvoř release body s přímo substituovanými proměnnými
+          BODY=$(cat <<BODY_END
+          ## 📝 Changes
+          
+          $(if [ -n "$PREVIOUS_TAG" ]; then echo "[View full diff](${URL}/${GITEA_REPO}/compare/${PREVIOUS_TAG}...${TAG})"; else echo "Initial release"; fi)
+          
+          ### Commits
+          
+          ${COMMIT_MESSAGES}
+          
+          ## 🐳 Docker Image
+          
+          \`\`\`bash
+          docker pull ${REGISTRY}/${REPO_LOWER}:${TAG}
+          docker pull ${REGISTRY}/${REPO_LOWER}:latest
+          \`\`\`
+          
+          ## 🚀 Quick Start
+          
+          ### Using docker run
+          
+          \`\`\`bash
+          docker run -d \\
+            --name ${REPO_NAME} \\
+            -p 127.0.0.1:8080:8080 \\
+            -e ALLOWED_COUNTRIES=CZ,SK,DE \\
+            -e BLOCKED_COUNTRIES=CN,RU \\
+            --restart unless-stopped \\
+            ${REGISTRY}/${REPO_LOWER}:${TAG}
+          \`\`\`
+          
+          ## 📊 Available Tags
+          
+          - \`latest\` - Latest stable release
+          - \`${TAG}\` - This specific version
+          - Multi-arch support: \`linux/amd64\`, \`linux/arm64\`
+          
+          ## 🔧 Configuration
+          
+          See [README.md](${URL}/${GITEA_REPO}/src/branch/main/README.md) for full configuration options and documentation.
+          BODY_END
+          )
+          
+          # Vytvoř JSON pomocí jq pro správné escapování
+          JSON_PAYLOAD=$(jq -n \
+            --arg tag "$TAG" \
+            --arg name "$REPO_NAME API $TAG" \
+            --arg body "$BODY" \
+            '{tag_name: $tag, name: $name, body: $body}')
+          
+          # Pošli request
+          curl -X POST \
+            -H "Authorization: token ${{ vars.GITEATOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD" \
+            "$URL/api/v1/repos/$GITEA_REPO/releases"
