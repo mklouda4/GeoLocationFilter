@@ -1,4 +1,4 @@
-﻿
+
 using GeoLocationFilter.Services;
 using Microsoft.AspNetCore.RateLimiting;
 using Prometheus;
@@ -8,6 +8,9 @@ namespace GeoLocationFilter
 {
     public class Program
     {
+        private static readonly Counter RateLimitHits = Metrics
+            .CreateCounter("geoguard_rate_limit_hits_total", "Rate limit hits by policy", "policy");
+
         public static void Main(string[] args)
         {
             var builder = WebApplication.CreateBuilder(args);
@@ -17,23 +20,42 @@ namespace GeoLocationFilter
             // Add services to the container.
             _ = builder.Services.Configure<SecurityOptions>(
                 builder.Configuration.GetSection(SecurityOptions.SectionName));
+            _ = builder.Services.PostConfigure<SecurityOptions>(options =>
+            {
+                if (options.LocalIps.Count == 0)
+                    options.LocalIps = [.. SecurityOptions.PrivateNetworkDefaults];
+                if (options.TrustedProxies.Count == 0)
+                    options.TrustedProxies = [.. SecurityOptions.PrivateNetworkDefaults];
+            });
+
+            builder.Services.AddSingleton<IClientIpResolver, ClientIpResolver>();
+            builder.Services.AddSingleton<IGeoLocationService, MaxMindGeoLocationService>();
 
             builder.Services.AddRateLimiter(options =>
             {
-                options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
-                {
-                    var ipAddress = GetClientIpAddress(context);
-
-                    return RateLimitPartition.GetFixedWindowLimiter(
-                        partitionKey: ipAddress ?? "unknown",
-                        factory: _ => new FixedWindowRateLimiterOptions
-                        {
-                            PermitLimit = builder.Configuration.GetValue<int>("RateLimit:PermitLimit", 100),
-                            Window = TimeSpan.FromMinutes(builder.Configuration.GetValue<int>("RateLimit:WindowMinutes", 1)),
-                            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-                            QueueLimit = builder.Configuration.GetValue<int>("RateLimit:QueueLimit", 0)
-                        });
-                });
+                // Global limit chained with a sliding-window burst limit, both partitioned by client IP.
+                options.GlobalLimiter = PartitionedRateLimiter.CreateChained(
+                    PartitionedRateLimiter.Create<HttpContext, string>(context =>
+                        RateLimitPartition.GetFixedWindowLimiter(
+                            partitionKey: GetClientIpAddress(context),
+                            factory: _ => new FixedWindowRateLimiterOptions
+                            {
+                                PermitLimit = builder.Configuration.GetValue<int>("RateLimit:PermitLimit", 100),
+                                Window = TimeSpan.FromMinutes(builder.Configuration.GetValue<int>("RateLimit:WindowMinutes", 1)),
+                                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                                QueueLimit = builder.Configuration.GetValue<int>("RateLimit:QueueLimit", 0)
+                            })),
+                    PartitionedRateLimiter.Create<HttpContext, string>(context =>
+                        RateLimitPartition.GetSlidingWindowLimiter(
+                            partitionKey: GetClientIpAddress(context),
+                            factory: _ => new SlidingWindowRateLimiterOptions
+                            {
+                                PermitLimit = builder.Configuration.GetValue<int>("RateLimit:Burst:PermitLimit", 200),
+                                Window = TimeSpan.FromMinutes(builder.Configuration.GetValue<int>("RateLimit:Burst:WindowMinutes", 1)),
+                                SegmentsPerWindow = 5,
+                                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                                QueueLimit = 0
+                            })));
 
                 options.AddFixedWindowLimiter("validation", options =>
                 {
@@ -45,44 +67,25 @@ namespace GeoLocationFilter
 
                 options.AddFixedWindowLimiter("health", options =>
                 {
-                    options.PermitLimit = builder.Configuration.GetValue<int>("RateLimit:Health:PermitLimit", 10);
+                    options.PermitLimit = builder.Configuration.GetValue<int>("RateLimit:Health:PermitLimit", 20);
                     options.Window = TimeSpan.FromMinutes(builder.Configuration.GetValue<int>("RateLimit:Health:WindowMinutes", 1));
-                    options.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
-                    options.QueueLimit = 0;
-                });
-
-                options.AddSlidingWindowLimiter("burst", options =>
-                {
-                    options.PermitLimit = builder.Configuration.GetValue<int>("RateLimit:Burst:PermitLimit", 200);
-                    options.Window = TimeSpan.FromMinutes(builder.Configuration.GetValue<int>("RateLimit:Burst:WindowMinutes", 1));
-                    options.SegmentsPerWindow = 5;
                     options.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
                     options.QueueLimit = 0;
                 });
 
                 options.OnRejected = async (context, token) =>
                 {
-                    var policy = "unknown";
+                    var policy = "global";
                     if (context.HttpContext.GetEndpoint()?.Metadata.GetMetadata<EnableRateLimitingAttribute>()?.PolicyName is string policyName)
                     {
                         policy = policyName;
-                    }
-                    else if (context.HttpContext.Request.Path.StartsWithSegments("/validate"))
-                    {
-                        policy = "validation";
                     }
                     else if (context.HttpContext.Request.Path.StartsWithSegments("/health"))
                     {
                         policy = "health";
                     }
-                    else
-                    {
-                        policy = "global";
-                    }
 
-                    // Increment rate limit metric
-                    Metrics.CreateCounter("geoguard_rate_limit_hits_total", "Rate limit hits by policy", "policy")
-                        .WithLabels(policy).Inc();
+                    RateLimitHits.WithLabels(policy).Inc();
 
                     context.HttpContext.Response.StatusCode = 429;
 
@@ -93,7 +96,6 @@ namespace GeoLocationFilter
                         context.HttpContext.Response.Headers.RetryAfter = retryAfter.TotalSeconds.ToString();
                     }
 
-                    context.HttpContext.Response.Headers.AddOrReplace("X-RateLimit-Limit", context.Lease.TryGetMetadata(MetadataName.ReasonPhrase, out var limit) ? limit.ToString() : "unknown");
                     context.HttpContext.Response.Headers.AddOrReplace("X-RateLimit-Remaining", "0");
                     context.HttpContext.Response.Headers.AddOrReplace("X-RateLimit-Reset", DateTimeOffset.UtcNow.Add(retryAfter).ToUnixTimeSeconds().ToString());
 
@@ -108,11 +110,10 @@ namespace GeoLocationFilter
                 };
             });
 
-            builder.Services.AddSingleton<IGeoLocationService, MaxMindGeoLocationService>();
             builder.Services.AddMetrics();
-            builder.Services.AddHealthChecks();
+            builder.Services.AddHealthChecks()
+                .AddCheck<MaxMindDatabaseHealthCheck>("maxmind-database");
             builder.Services.AddMemoryCache();
-            builder.Services.AddHttpClient();
             builder.Services.AddHttpClient("GeoApi", client =>
             {
                 client.Timeout = TimeSpan.FromSeconds(5);
@@ -132,10 +133,10 @@ namespace GeoLocationFilter
                 app.UseSwaggerUI();
             }
 
-            app.MapHealthChecks("/health");
             app.UseHttpMetrics();
+            app.UseRateLimiter();
+            app.MapHealthChecks("/health").RequireRateLimiting("health");
             app.MapMetrics();
-            app.UseHttpsRedirection();
             app.UseAuthorization();
             app.MapControllers();
 
@@ -143,17 +144,7 @@ namespace GeoLocationFilter
         }
 
         private static string GetClientIpAddress(HttpContext context)
-        {
-            var ipSources = new[]
-            {
-                context.Request.Headers["X-Real-IP"].FirstOrDefault(),
-                context.Request.Headers["X-Forwarded-For"].FirstOrDefault()?.Split(',').FirstOrDefault()?.Trim(),
-                context.Request.Headers["CF-Connecting-IP"].FirstOrDefault(),
-                context.Connection.RemoteIpAddress?.ToString()
-            };
-
-            return ipSources.FirstOrDefault(ip => !string.IsNullOrWhiteSpace(ip)) ?? "unknown";
-        }
+            => context.RequestServices.GetRequiredService<IClientIpResolver>().GetClientIp(context) ?? "unknown";
 
         /// <summary>
         /// Configures environment variable overrides for Docker deployment
@@ -195,6 +186,8 @@ namespace GeoLocationFilter
                 $"{SecurityOptions.SectionName}:{nameof(SecurityOptions.AllowedCountries)}", configuration);
             HandleArrayEnvironmentVariable("LOCAL_IPS",
                 $"{SecurityOptions.SectionName}:{nameof(SecurityOptions.LocalIps)}", configuration);
+            HandleArrayEnvironmentVariable("TRUSTED_PROXIES",
+                $"{SecurityOptions.SectionName}:{nameof(SecurityOptions.TrustedProxies)}", configuration);
         }
         private static void HandleArrayEnvironmentVariable(string envKey, string configPath, IConfiguration configuration)
         {

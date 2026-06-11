@@ -1,5 +1,6 @@
-﻿using GeoLocationFilter.Services;
+using GeoLocationFilter.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 using Prometheus;
@@ -9,11 +10,13 @@ namespace GeoLocationFilter.Controllers
 {
     [ApiController]
     [Route("[controller]")]
+    [EnableRateLimiting("validation")]
     public class ValidationController(
         IConfiguration configuration,
         IOptions<SecurityOptions> options,
         ILogger<ValidationController> logger,
         IGeoLocationService locationService,
+        IClientIpResolver clientIpResolver,
         IHttpClientFactory httpClientFactory,
         IMemoryCache cache) : ControllerBase
     {
@@ -21,6 +24,7 @@ namespace GeoLocationFilter.Controllers
 
         private readonly SecurityOptions _options = options.Value;
         private static readonly TimeSpan CacheTimeout = TimeSpan.FromHours(24);
+        private static readonly TimeSpan NegativeCacheTimeout = TimeSpan.FromMinutes(5);
 
         private static readonly Counter RequestsTotal = Metrics
             .CreateCounter("geoguard_requests_total", "Total validation requests", "result", "country", "reason");
@@ -48,12 +52,13 @@ namespace GeoLocationFilter.Controllers
         {
             using var timer = RequestDuration.NewTimer();
 
-            var clientIp = GetClientIpAddress();
+            var clientIp = clientIpResolver.GetClientIp(HttpContext);
             var forwardedHost = Request.Headers["X-Forwarded-Host"].FirstOrDefault();
             var forwardedUri = Request.Headers["X-Forwarded-Uri"].FirstOrDefault();
             var userAgent = Request.Headers.UserAgent.FirstOrDefault();
 
-            logger.LogInformation($"Validating request: IP={clientIp}, Host={forwardedHost}, URI={forwardedUri}");
+            logger.LogInformation("Validating request: IP={ClientIp}, Host={ForwardedHost}, URI={ForwardedUri}",
+                clientIp, forwardedHost, forwardedUri);
 
             var securityOptions = CreateSecurityOptionsFromQuery(
                 blockedCountries, allowedCountries, blockUnknown, ignoreLocalIps, localIps);
@@ -74,16 +79,17 @@ namespace GeoLocationFilter.Controllers
 
                 if (blockResult.IsBlocked)
                 {
-                    logger.LogWarning($"Request blocked: IP={clientIp}, Country={blockResult.CountryCode}, Reason={blockResult.Reason}");
+                    logger.LogWarning("Request blocked: IP={ClientIp}, Country={CountryCode}, Reason={Reason}",
+                        clientIp, blockResult.CountryCode, blockResult.Reason);
                     return StatusCode(403, new { message = "Access denied", country = blockResult.CountryCode, reason = blockResult.Reason, ipAddress = clientIp });
                 }
 
-                logger.LogDebug($"Request allowed: IP={clientIp}, Country={blockResult.CountryCode}");
+                logger.LogDebug("Request allowed: IP={ClientIp}, Country={CountryCode}", clientIp, blockResult.CountryCode);
                 return Ok(new { message = "Access granted", country = blockResult.CountryCode, ipAddress = clientIp });
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, $"Error during request validation for IP={clientIp}");
+                logger.LogError(ex, "Error during request validation for IP={ClientIp}", clientIp);
 
                 RequestsTotal.WithLabels("error", "unknown", "exception").Inc();
 
@@ -99,21 +105,26 @@ namespace GeoLocationFilter.Controllers
         [HttpGet("/ip")]
         public IActionResult IpRequest()
         {
-            var ipAddress = GetClientIpAddress();
+            var ipAddress = clientIpResolver.GetClientIp(HttpContext);
             return Ok(new { ipAddress });
         }
-
 
         [HttpGet("/check")]
         public async Task<IActionResult> CheckIp([FromQuery] string ipAddress)
         {
+            if (!IPAddress.TryParse(ipAddress, out _))
+            {
+                return BadRequest(new { error = "Invalid IP address", ipAddress });
+            }
+
             try
             {
                 var countryCode = await GetCountryCodeForIp(ipAddress);
                 return Ok(new { ipAddress, countryCode });
             }
-            catch 
+            catch (Exception ex)
             {
+                logger.LogError(ex, "Error checking country for IP={IpAddress}", ipAddress);
                 return Ok(new { ipAddress, countryCode = "NA", status = "Error" });
             }
         }
@@ -125,10 +136,10 @@ namespace GeoLocationFilter.Controllers
             bool? ignoreLocalIps,
             string? localIps)
         {
-            if (string.IsNullOrEmpty(blockedCountries?.Trim()) && 
-                string.IsNullOrEmpty(allowedCountries?.Trim()) &&
-                string.IsNullOrEmpty(localIps?.Trim()) &&
-                blockUnknown == null && 
+            if (blockedCountries == null &&
+                allowedCountries == null &&
+                localIps == null &&
+                blockUnknown == null &&
                 ignoreLocalIps == null
             )
             {
@@ -140,51 +151,21 @@ namespace GeoLocationFilter.Controllers
                 BlockUnknown = blockUnknown ?? _options.BlockUnknown,
                 IgnoreLocalIps = ignoreLocalIps ?? _options.IgnoreLocalIps,
 
-                BlockedCountries = blockedCountries != null ? (ParseCountryList(blockedCountries) ?? []) : _options.BlockedCountries,
-                AllowedCountries = allowedCountries != null ? (ParseCountryList(allowedCountries) ?? []) : _options.AllowedCountries,
-                LocalIps = localIps != null ? (ParseIpList(localIps) ?? []) : _options.LocalIps
+                BlockedCountries = blockedCountries != null ? IpUtils.ParseCountryList(blockedCountries) : _options.BlockedCountries,
+                AllowedCountries = allowedCountries != null ? IpUtils.ParseCountryList(allowedCountries) : _options.AllowedCountries,
+                LocalIps = localIps != null ? IpUtils.ParseList(localIps) : _options.LocalIps,
+                TrustedProxies = _options.TrustedProxies
             };
 
-            logger.LogDebug($"Using query-based security options: BlockUnknown={options.BlockUnknown}, " +
-                           $"IgnoreLocalIps={options.IgnoreLocalIps}, " +
-                           $"BlockedCountries=[{string.Join(",", options.BlockedCountries)}], " +
-                           $"AllowedCountries=[{string.Join(",", options.AllowedCountries)}], " +
-                           $"LocalIps=[{string.Join(",", options.LocalIps)}]");
+            logger.LogDebug("Using query-based security options: BlockUnknown={BlockUnknown}, " +
+                            "IgnoreLocalIps={IgnoreLocalIps}, BlockedCountries={BlockedCountries}, " +
+                            "AllowedCountries={AllowedCountries}, LocalIps={LocalIps}",
+                options.BlockUnknown, options.IgnoreLocalIps,
+                string.Join(",", options.BlockedCountries),
+                string.Join(",", options.AllowedCountries),
+                string.Join(",", options.LocalIps));
 
             return options;
-        }
-        private static List<string>? ParseCountryList(string? countries)
-        {
-            if (string.IsNullOrWhiteSpace(countries))
-                return null;
-
-            return [.. countries
-                .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                .Select(c => c.Trim().ToUpperInvariant())
-                .Where(c => !string.IsNullOrEmpty(c))];
-        }
-
-        private static List<string>? ParseIpList(string? ips)
-        {
-            if (string.IsNullOrWhiteSpace(ips))
-                return null;
-
-            return [.. ips
-                .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                .Select(ip => ip.Trim())
-                .Where(ip => !string.IsNullOrEmpty(ip))];
-        }
-        private string? GetClientIpAddress()
-        {
-            var ipSources = new[]
-            {
-                Request.Headers["X-Real-IP"].FirstOrDefault(),
-                Request.Headers["X-Forwarded-For"].FirstOrDefault()?.Split(',').FirstOrDefault()?.Trim(),
-                Request.Headers["CF-Connecting-IP"].FirstOrDefault(),
-                Request.HttpContext.Connection.RemoteIpAddress?.ToString()
-            };
-
-            return ipSources.FirstOrDefault(ip => !string.IsNullOrWhiteSpace(ip));
         }
 
         private async Task<BlockResult> ShouldBlockRequest(string? clientIp, string? host, string? uri, string? userAgent, SecurityOptions securityOptions)
@@ -205,12 +186,12 @@ namespace GeoLocationFilter.Controllers
                 return new BlockResult(securityOptions.BlockUnknown, "UNKNOWN", "unknown-country", host, uri, userAgent);
             }
 
-            if (securityOptions.BlockedCountries.Count > 0 && securityOptions.BlockedCountries.Contains(countryCode))
+            if (securityOptions.BlockedCountries.Count > 0 && securityOptions.BlockedCountries.Contains(countryCode, StringComparer.OrdinalIgnoreCase))
             {
                 return new BlockResult(true, countryCode, "in-blocklist", host, uri, userAgent);
             }
 
-            if (securityOptions.AllowedCountries.Count > 0 && !securityOptions.AllowedCountries.Contains(countryCode))
+            if (securityOptions.AllowedCountries.Count > 0 && !securityOptions.AllowedCountries.Contains(countryCode, StringComparer.OrdinalIgnoreCase))
             {
                 return new BlockResult(true, countryCode, "not-in-allowlist", host, uri, userAgent);
             }
@@ -223,51 +204,7 @@ namespace GeoLocationFilter.Controllers
             if (!IPAddress.TryParse(ipAddress, out var ip))
                 return false;
 
-            foreach (var localRange in securityOptions.LocalIps)
-            {
-                if (IsIpInRange(ip, localRange))
-                    return true;
-            }
-
-            return false;
-        }
-
-        private static bool IsIpInRange(IPAddress ip, string cidrRange)
-        {
-            try
-            {
-                var parts = cidrRange.Split('/');
-                if (parts.Length != 2) return false;
-
-                var networkAddress = IPAddress.Parse(parts[0]);
-                var prefixLength = int.Parse(parts[1]);
-
-                var networkBytes = networkAddress.GetAddressBytes();
-                var ipBytes = ip.GetAddressBytes();
-
-                if (networkBytes.Length != ipBytes.Length) return false;
-
-                var bytesToCheck = prefixLength / 8;
-                var bitsToCheck = prefixLength % 8;
-
-                for (int i = 0; i < bytesToCheck; i++)
-                {
-                    if (networkBytes[i] != ipBytes[i]) return false;
-                }
-
-                if (bitsToCheck > 0 && bytesToCheck < networkBytes.Length)
-                {
-                    var mask = (byte)(0xFF << (8 - bitsToCheck));
-                    if ((networkBytes[bytesToCheck] & mask) != (ipBytes[bytesToCheck] & mask))
-                        return false;
-                }
-
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
+            return IpUtils.IsInAnyRange(ip, securityOptions.LocalIps);
         }
 
         private async Task<string?> GetCountryCodeForIp(string ipAddress)
@@ -275,7 +212,7 @@ namespace GeoLocationFilter.Controllers
             var cacheKey = $"geo_{ipAddress}";
             if (cache.TryGetValue(cacheKey, out string? cachedCountry))
             {
-                logger.LogDebug($"Country code for IP {ipAddress} found in cache: {cachedCountry}");
+                logger.LogDebug("Country code for IP {IpAddress} found in cache: {CountryCode}", ipAddress, cachedCountry);
                 CacheHits.Inc();
                 return cachedCountry;
             }
@@ -288,7 +225,12 @@ namespace GeoLocationFilter.Controllers
             if (countryCode != null)
             {
                 cache.Set(cacheKey, countryCode, CacheTimeout);
-                logger.LogDebug($"Cached country code for IP {ipAddress}: {countryCode}");
+                logger.LogDebug("Cached country code for IP {IpAddress}: {CountryCode}", ipAddress, countryCode);
+            }
+            else
+            {
+                // Negative cache so repeated requests from unresolvable IPs don't hammer the fallback API
+                cache.Set(cacheKey, (string?)null, NegativeCacheTimeout);
             }
             return countryCode;
         }
@@ -321,25 +263,25 @@ namespace GeoLocationFilter.Controllers
                         return null;
                     }
 
-                    logger.LogDebug($"Geo API returned country code for IP {ipAddress}: {countryCode}");
+                    logger.LogDebug("Geo API returned country code for IP {IpAddress}: {CountryCode}", ipAddress, countryCode);
                     GeoApiCalls.WithLabels("success").Inc();
                     return countryCode.ToUpperInvariant();
                 }
 
-                logger.LogWarning($"Geo API returned non-success status for IP {ipAddress}: {response.StatusCode}");
-                GeoApiCalls.WithLabels("geojs", "http_error").Inc();
+                logger.LogWarning("Geo API returned non-success status for IP {IpAddress}: {StatusCode}", ipAddress, response.StatusCode);
+                GeoApiCalls.WithLabels("http_error").Inc();
                 return null;
             }
             catch (TaskCanceledException)
             {
-                logger.LogWarning($"Geo API timeout for IP {ipAddress}");
-                GeoApiCalls.WithLabels("geojs", "timeout").Inc();
+                logger.LogWarning("Geo API timeout for IP {IpAddress}", ipAddress);
+                GeoApiCalls.WithLabels("timeout").Inc();
                 return null;
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, $"Error calling geo API for IP {ipAddress}");
-                GeoApiCalls.WithLabels("geojs", "exception").Inc();
+                logger.LogError(ex, "Error calling geo API for IP {IpAddress}", ipAddress);
+                GeoApiCalls.WithLabels("exception").Inc();
                 return null;
             }
         }

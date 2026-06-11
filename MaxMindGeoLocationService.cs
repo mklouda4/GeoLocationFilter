@@ -1,4 +1,4 @@
-﻿using MaxMind.GeoIP2;
+using MaxMind.GeoIP2;
 using Prometheus;
 using System.Net;
 
@@ -12,12 +12,14 @@ namespace GeoLocationFilter.Services
 
     public class MaxMindGeoLocationService : IGeoLocationService, IDisposable
     {
+        private static readonly TimeSpan ReloadDebounce = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan OldReaderDisposeDelay = TimeSpan.FromSeconds(30);
+
         private readonly ILogger<MaxMindGeoLocationService> _logger;
-        private readonly IConfiguration _configuration;
+        private readonly string _databasePath;
         private DatabaseReader? _reader;
         private FileSystemWatcher? _fileWatcher;
-        private string? _databasePath;
-        private SemaphoreLock _lock = new();
+        private CancellationTokenSource? _reloadCts;
 
         // Metrics
         private static readonly Counter MaxMindLookups = Metrics
@@ -26,65 +28,50 @@ namespace GeoLocationFilter.Services
         private static readonly Gauge DatabaseLoadTime = Metrics
             .CreateGauge("geoguard_maxmind_database_load_timestamp", "Last database load time");
 
-        public bool IsReady => _reader != null;
+        public bool IsReady => Volatile.Read(ref _reader) != null;
 
         public MaxMindGeoLocationService(ILogger<MaxMindGeoLocationService> logger, IConfiguration configuration)
         {
             _logger = logger;
-            _configuration = configuration;
-            _databasePath = _configuration["DbPath"] ?? $"/data/GeoLite2-Country.mmdb";
+            _databasePath = configuration["DbPath"] ?? "/data/GeoLite2-Country.mmdb";
 
-            _ = InitializeAsync();
-        }
-
-        private async Task InitializeAsync()
-        {
-            await LoadDatabaseAsync();
+            LoadDatabase();
             SetupFileWatcher();
         }
 
-        private async Task LoadDatabaseAsync()
+        private void LoadDatabase()
         {
             try
             {
-                if (string.IsNullOrEmpty(_databasePath) || !File.Exists(_databasePath))
+                if (!File.Exists(_databasePath))
                 {
                     _logger.LogWarning("MaxMind database not found at path: {DatabasePath}", _databasePath);
                     return;
                 }
 
-                await _lock.WaitAsync();
-                {
-                    _reader?.Dispose();
-                    _reader = new DatabaseReader(_databasePath);
-                }
-                _lock.Release();
+                var newReader = new DatabaseReader(_databasePath);
+
+                // Atomic swap; in-flight lookups may still hold the old reader,
+                // so it is disposed with a delay instead of immediately.
+                var oldReader = Interlocked.Exchange(ref _reader, newReader);
+                DisposeLater(oldReader);
 
                 DatabaseLoadTime.SetToCurrentTimeUtc();
 
                 _logger.LogInformation("MaxMind database loaded successfully from {DatabasePath}", _databasePath);
-                _logger.LogInformation("Database metadata: {Metadata}",
-                    $"Type: {_reader.Metadata.DatabaseType}, Build: {_reader.Metadata.BuildDate}");
-
-                await Task.CompletedTask;
+                _logger.LogInformation("Database metadata: Type: {DatabaseType}, Build: {BuildDate}",
+                    newReader.Metadata.DatabaseType, newReader.Metadata.BuildDate);
             }
             catch (Exception ex)
             {
+                // Keep the previously loaded database (if any) so a failed reload
+                // does not take the service down.
                 _logger.LogError(ex, "Failed to load MaxMind database from {DatabasePath}", _databasePath);
-                await _lock.WaitAsync();
-                {
-                    _reader?.Dispose();
-                    _reader = null;
-                }
-                _lock.Release();
             }
         }
 
         private void SetupFileWatcher()
         {
-            if (string.IsNullOrEmpty(_databasePath))
-                return;
-
             try
             {
                 var directory = Path.GetDirectoryName(_databasePath);
@@ -104,6 +91,8 @@ namespace GeoLocationFilter.Services
                 };
 
                 _fileWatcher.Changed += OnDatabaseFileChanged;
+                _fileWatcher.Created += OnDatabaseFileChanged;
+                _fileWatcher.Renamed += OnDatabaseFileChanged;
 
                 _logger.LogInformation("File watcher setup for MaxMind database: {DatabasePath}", _databasePath);
             }
@@ -113,13 +102,33 @@ namespace GeoLocationFilter.Services
             }
         }
 
-        private async void OnDatabaseFileChanged(object sender, FileSystemEventArgs e)
+        private void OnDatabaseFileChanged(object sender, FileSystemEventArgs e)
+        {
+            // A single file replacement raises several events — debounce them
+            // so the database is reloaded once, after the writes settle down.
+            var cts = new CancellationTokenSource();
+            var previous = Interlocked.Exchange(ref _reloadCts, cts);
+            previous?.Cancel();
+            previous?.Dispose();
+
+            _ = DebouncedReloadAsync(cts.Token);
+        }
+
+        private async Task DebouncedReloadAsync(CancellationToken cancellationToken)
         {
             try
             {
+                await Task.Delay(ReloadDebounce, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            try
+            {
                 _logger.LogInformation("MaxMind database file changed, reloading...");
-                await Task.Delay(5000);
-                await LoadDatabaseAsync();
+                LoadDatabase();
             }
             catch (Exception ex)
             {
@@ -127,83 +136,64 @@ namespace GeoLocationFilter.Services
             }
         }
 
-        public async Task<string?> GetCountryCodeAsync(string ipAddress)
+        public Task<string?> GetCountryCodeAsync(string ipAddress)
         {
             if (!IPAddress.TryParse(ipAddress, out var ip))
             {
                 MaxMindLookups.WithLabels("invalid_ip").Inc();
-                return null;
+                return Task.FromResult<string?>(null);
             }
 
-            DatabaseReader? reader;
-            await _lock.WaitAsync();
-            {
-                reader = _reader;
-            }
-            _lock.Release();
-
+            var reader = Volatile.Read(ref _reader);
             if (reader == null)
             {
                 MaxMindLookups.WithLabels("no_database").Inc();
-                return null;
+                return Task.FromResult<string?>(null);
             }
 
             try
             {
                 if (reader.TryCountry(ip, out var response) && response != null)
                 {
-                    var countryCode = response.Country.IsoCode;
                     MaxMindLookups.WithLabels("success").Inc();
-                    return countryCode;
+                    return Task.FromResult(response.Country.IsoCode);
                 }
-                else
-                {
-                    MaxMindLookups.WithLabels("not_found").Inc();
-                    return null;
-                }
+
+                MaxMindLookups.WithLabels("not_found").Inc();
+                return Task.FromResult<string?>(null);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error looking up country for IP {IpAddress}", ipAddress);
                 MaxMindLookups.WithLabels("error").Inc();
-                return null;
+                return Task.FromResult<string?>(null);
             }
+        }
+
+        private static void DisposeLater(IDisposable? disposable)
+        {
+            if (disposable == null)
+                return;
+
+            _ = Task.Delay(OldReaderDisposeDelay).ContinueWith(_ =>
+            {
+                try
+                {
+                    disposable.Dispose();
+                }
+                catch
+                {
+                    // best effort — nothing meaningful to do with a failed dispose
+                }
+            });
         }
 
         public void Dispose()
         {
             _fileWatcher?.Dispose();
-            lock (_lock)
-            {
-                _reader?.Dispose();
-            }
-        }
-    }
-
-    public class SemaphoreLock : IDisposable
-    {
-        private readonly SemaphoreSlim semaphoreSlim = new(1, 1);
-        private readonly TimeSpan defaultTimeOut = TimeSpan.FromSeconds(30);
-
-        public Task WaitAsync(TimeSpan? timeOut = null)
-            => semaphoreSlim.WaitAsync(timeOut ?? defaultTimeOut);
-        public void Wait(TimeSpan? timeOut = null)
-            => semaphoreSlim.WaitAsync(timeOut ?? defaultTimeOut);
-
-        public void Release()
-            => semaphoreSlim.Release();
-
-        protected virtual void Dispose(bool disposing)
-        {
-            semaphoreSlim?.Dispose();
-        }
-
-        ~SemaphoreLock()
-            => Dispose(disposing: false);
-        
-        public void Dispose()
-        {
-            Dispose(disposing: true);
+            _reloadCts?.Cancel();
+            _reloadCts?.Dispose();
+            Interlocked.Exchange(ref _reader, null)?.Dispose();
             GC.SuppressFinalize(this);
         }
     }

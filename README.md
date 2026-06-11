@@ -1,11 +1,11 @@
 ﻿# GeoLocationFilter
 
 [![Docker](https://img.shields.io/badge/Docker-Available-blue?style=flat-square&logo=docker)](https://github.com/mklouda4/geolocationfilter)
-[![.NET 8](https://img.shields.io/badge/.NET-8.0-purple?style=flat-square&logo=dotnet)](https://dotnet.microsoft.com/)
+[![.NET 10](https://img.shields.io/badge/.NET-10.0-purple?style=flat-square&logo=dotnet)](https://dotnet.microsoft.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Prometheus](https://img.shields.io/badge/Metrics-Prometheus-orange?style=flat-square&logo=prometheus)](https://prometheus.io/)
 
-A high-performance REST API service for intelligent geolocation-based request filtering. Built with .NET 8, it provides country-based access control with comprehensive monitoring and enterprise-grade features.
+A high-performance REST API service for intelligent geolocation-based request filtering. Built with .NET 10, it provides country-based access control with comprehensive monitoring and enterprise-grade features.
 
 ## 🚀 Key Features
 
@@ -15,6 +15,7 @@ A high-performance REST API service for intelligent geolocation-based request fi
 - **MaxMind GeoLite2** integration for accurate geolocation
 - **Fallback API support** for enhanced reliability
 - **Local IP detection** with configurable CIDR ranges
+- **Trusted proxy validation** — forwarding headers are only honored from configured proxy networks, so clients cannot spoof their IP
 - **Rate limiting** with per-endpoint configuration
 
 ### **Production Ready**
@@ -35,7 +36,7 @@ A high-performance REST API service for intelligent geolocation-based request fi
 
 ## 📋 Requirements
 
-- **.NET 8.0** Runtime
+- **.NET 10.0** Runtime
 - **MaxMind GeoLite2-Country.mmdb** database
 - **Docker** (optional, for containerized deployment)
 
@@ -68,6 +69,11 @@ A high-performance REST API service for intelligent geolocation-based request fi
 3. **Run Application**
    ```bash
    dotnet run --project GeoLocationFilter.csproj
+   ```
+
+4. **Run Tests**
+   ```bash
+   dotnet test
    ```
    
    🌐 **Access:** http://localhost:8080  
@@ -103,7 +109,6 @@ services:
       - TZ=Europe/Prague
       - ASPNETCORE_ENVIRONMENT=Production
       - ASPNETCORE_URLS=http://+:8080
-      - ASPNETCORE_FORWARDEDHEADERS_ENABLED=true
       
       # Security Configuration
       - BLOCK_UNKNOWN=true
@@ -111,6 +116,8 @@ services:
       - ALLOWED_COUNTRIES=CZ,SK
       - BLOCKED_COUNTRIES=CN,RU
       - LOCAL_IPS=127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
+      # Networks allowed to set X-Forwarded-For / X-Real-IP / CF-Connecting-IP
+      - TRUSTED_PROXIES=127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
       
       # Rate Limiting
       - RATELIMIT_PERMIT_LIMIT=100
@@ -135,11 +142,12 @@ services:
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
 | `DB_PATH` | Path to GeoLite2 database (optional, if not mounted data directory) | `/data/GeoLite2-Country.mmdb` | `/data/GeoLite2-Country.mmdb` |
-| `BLOCK_UNKNOWN` | Block requests with unknown country | `false` | `true` |
+| `BLOCK_UNKNOWN` | Block requests with unknown country | `true` | `true` |
 | `IGNORE_LOCAL_IPS` | Ignore local/private IP ranges | `true` | `true` |
 | `ALLOWED_COUNTRIES` | Comma-separated allowlist | - | `CZ,SK,DE` |
 | `BLOCKED_COUNTRIES` | Comma-separated blocklist | - | `CN,RU,KP` |
-| `LOCAL_IPS` | CIDR ranges for local IPs | See defaults | `192.168.0.0/16,10.0.0.0/8` |
+| `LOCAL_IPS` | CIDR ranges for local IPs | Loopback + private ranges | `192.168.0.0/16,10.0.0.0/8` |
+| `TRUSTED_PROXIES` | CIDR ranges of proxies whose forwarding headers (`X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`) are trusted. Headers from other sources are ignored and the socket address is used instead. | Loopback + private ranges | `10.0.0.0/8` |
 | `FALLBACK_API` | Fallback geolocation API | `https://get.geojs.io/v1/ip/country/{0}` | Custom API URL |
 
 ### Rate Limiting Configuration
@@ -150,7 +158,7 @@ services:
 | `RATELIMIT_WINDOW_MINUTES` | Rate limit window | `1` |
 | `RATELIMIT_VALIDATION_PERMIT_LIMIT` | Validation endpoint limit | `100` |
 | `RATELIMIT_HEALTH_PERMIT_LIMIT` | Health endpoint limit | `20` |
-| `RATELIMIT_BURST_PERMIT_LIMIT` | Burst limit | `200` |
+| `RATELIMIT_BURST_PERMIT_LIMIT` | Burst limit (sliding window, chained with the global limit) | `200` |
 
 ---
 
@@ -204,8 +212,7 @@ GET /validate
 {
   "message": "Access granted",
   "country": "CZ",
-  "ipAddress": "192.168.1.100",
-  "timestamp": "2025-08-15T10:30:00Z"
+  "ipAddress": "192.168.1.100"
 }
 ```
 
@@ -239,7 +246,7 @@ GET /check?ipAddress=1.2.3.4
 Returns the country code for a specific IP address.
 
 **Parameters:**
-- `ipAddress` (required): IP address to check
+- `ipAddress` (required): IP address to check — invalid values return `400 Bad Request`
 
 **Response:**
 ```json
@@ -265,7 +272,7 @@ All validation responses include custom headers:
 ```http
 GET /health
 ```
-Returns service health status.
+Returns service health status. Reports `Degraded` when the MaxMind database is not loaded (the service then relies on the fallback API only).
 
 #### **Metrics**
 ```http
@@ -344,6 +351,7 @@ histogram_quantile(0.95, rate(geoguard_request_duration_seconds_bucket[$__rate_i
 
 ## 🛡️ Security Considerations
 
+- **Trusted Proxies**: Forwarding headers (`X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`) are honored only when the request arrives from a network listed in `TRUSTED_PROXIES` (default: loopback + private ranges). Direct clients cannot spoof their IP to bypass the filter. If the service is exposed publicly, restrict `TRUSTED_PROXIES` to the actual proxy addresses. Do **not** set `ASPNETCORE_FORWARDEDHEADERS_ENABLED=true` — it would rewrite the connection address from `X-Forwarded-For` without any proxy validation and bypass this protection.
 - **IP Validation**: Supports IPv4 and IPv6 with proper validation
 - **Rate Limiting**: Configurable per-endpoint protection
 - **Private IP Handling**: Automatic detection of local/private networks
@@ -397,6 +405,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 <div align="center">
 
-**Built with ❤️ using .NET 8**
+**Built with ❤️ using .NET 10**
 
 </div>
